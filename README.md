@@ -5,76 +5,72 @@ Use a pen tablet (Wacom or any evdev tablet) like a **native touch screen** on L
 Project fully vibe coded, ty.
 
 
-* One big **on/off switch** in a small window. It stays on/off across logouts and reboots until you change it.
-* The pen becomes a real virtual multitouch screen, so every app handles it *natively*: touch scrolling with
-  the app's own smooth inertia, long-press for the context menu, double-tap a word to select it (with the
-  toolkit's own selection handles where it has them), tap to click.
-* A cursor follows the pen all the time (also while you scroll). Optional.
-* No modes. Want pressure for drawing? Flip the switch off: the tablet goes back to normal instantly.
-* Single self-contained **AppImage**; works on any x86-64 distro with glibc 2.17+ (Ubuntu 18.04+, Debian 9+, Fedora, Arch, ...).
+* One big **on/off switch** in a small window. It stays on or off across logouts and reboots until you change it.
+* A single **AppImage** that runs on practically any x86-64 distro (needs glibc 2.17+, i.e. anything from the last ~10 years).
+* **No modes.** Want pressure for drawing? Flip the switch off and the tablet is back to normal instantly.
+
+## Gestures
+
+| You do                      | You get                                                                 |
+|-----------------------------|-------------------------------------------------------------------------|
+| **tap**                     | left click                                                              |
+| **double-tap**              | double click: select a word (or open a file)                            |
+| **triple-tap**              | triple click: select a line / paragraph                                 |
+| **drag** straight away      | scroll - mouse wheel (default, works in every app) or native touch scrolling (see Options) |
+| **hold, then drag**         | a **real mouse drag**: select text, rubber-band several files, drag & drop. Let go and scrolling is back on |
+| **hold still**              | right click                                                             |
+| pen **side buttons**        | lower = right click, upper = middle click                               |
+
+The cursor follows the pen while it hovers. In wheel mode (default) it stays where you started while you scroll - that is what makes every app scroll the right thing - and glides back when you lift. In touch mode it follows the pen even while scrolling.
+
+*Why hold-then-drag is a real mouse drag and not touch:* toolkits such as Qt Widgets (Dolphin) turn a touch
+hold into a fake mouse press, then treat the cursor's own movement as "button released" - which left a 1x1
+selection stuck and made multi-select impossible. A genuine mouse button has no such problem.
 
 ## Use it
 
 1. Download `PenTouch-x86_64.AppImage`, `chmod +x` it, run it.
 2. First run only: if it says **One-time setup needed**, press **Fix permissions** (asks for your password once).
-   This installs a udev rule so *your user* may create the virtual touch screen and read the tablet. No restart.
-3. Flip the switch. Done. Close the window if you like - it keeps running in the background and starts at login.
+   This installs a udev rule so *your user* may create the virtual devices and read the tablet. No restart.
+3. Flip the switch. Close the window if you like - it keeps running and starts at login.
 
-From a terminal: `PenTouch.AppImage on | off | toggle | status`.
+From a terminal: `PenTouch.AppImage on | off | toggle | status`, and `PenTouch.AppImage single-click on|off`.
 
-| Gesture            | Result                                                     |
-|--------------------|------------------------------------------------------------|
-| tap                | click                                                      |
-| drag               | scroll (the app's native touch scrolling, with inertia)    |
-| hold               | right-click / context menu (the app's native long-press)   |
-| double-tap on text | select a word; drag the handles to extend (where the app shows them) |
-
-### Options (in the window)
+## Options (in the window)
 
 * **Start automatically when I log in** (default on).
-* **Show a cursor that follows the pen**. If some app hides its touch selection handles while the cursor moves,
-  turn this off and you get a pure touch screen.
-* **Tap tolerance** - how far the pen may wobble during a tap/long-press (default 2 mm). Hand tremor on a tablet
-  would otherwise cancel taps and long-presses because 1 mm of pen is ~12 px on screen.
+* **Cursor follows the pen** while hovering (and while touch-scrolling). Off = the cursor jumps to the pen only when you tap or hold.
+* **Scrolling** - *Mouse wheel* (default): works in literally every app, Dolphin included; has a speed slider.
+  *Touch*: the app's own native touch scrolling, and the cursor follows the pen - but apps without native touch
+  scrolling (Dolphin, other Qt Widgets apps) treat a touch drag as a selection, so use the wheel there.
+* **Single click opens files and folders** - flips your desktop's own setting (KDE, GNOME, Cinnamon, MATE, XFCE),
+  so it also applies to a normal mouse. Reopen a file-manager window if it does not change at once.
+* **Tap tolerance** - how far the pen may wobble during a tap/hold (default 2 mm). 1 mm of pen is ~12 px on screen,
+  so without this, hand tremor would cancel taps and long-presses.
 * **Tablet rotation** 0/90/180/270.
-* **Cursor area** - for several monitors: which part of the desktop the cursor covers. For *touches*, pick the
-  output in your desktop's own touch-screen settings (e.g. KDE: System Settings > Input Devices > Touchscreen).
+* **Cursor area** - several monitors: which part of the desktop the cursor covers. For touch scrolling also pick the
+  output in your system's touch-screen settings (KDE: System Settings > Input Devices > Touchscreen).
 
 ## How it works
 
 ```
- pen tablet (grabbed) --> filter --> "Pen Touchscreen (virtual)"   multitouch screen, 1 finger
-                            \-----> "Pen Cursor (virtual)"         absolute mouse, move only
+ pen tablet (grabbed) --> gesture engine --> "Pen Cursor (virtual)"        absolute mouse: cursor, clicks, drags, wheel
+                                         \-> "Pen Touchscreen (virtual)"   multitouch screen: native scrolling
 ```
 
-The **filter** makes a pen behave like a finger: it ignores contact blips, holds the touch still inside the tap
-tolerance (so taps and long-presses are steady), glides the touch to the pen instead of jumping when a drag
-starts (a jump would look like a fling), bridges pressure flicker, and snaps a quick second tap onto the first so
-double-tap is recognised.
+Every gesture is decided *before* anything is sent, so apps never see a half-started touch. The **background
+service** (`pen-touch --daemon`) owns the devices and obeys the saved switch (`~/.config/pen-touch/config.toml`);
+it starts at login (`~/.config/autostart/pen-touch.desktop`). The window is only a remote control for it.
 
-The **background service** (`pen-touch --daemon`) owns the devices. It reads the saved switch
-(`~/.config/pen-touch/config.toml`), starts at login (`~/.config/autostart/pen-touch.desktop`) and obeys the
-window, which is only a remote control. Status is shared through `$XDG_RUNTIME_DIR/pen-touch/status.json`.
+## Build it yourself
 
-## Build
-
-```sh
-cargo install cargo-zigbuild --locked      # once
-pip install ziglang                        # once
-./build-appimage.sh                        # -> PenTouch-x86_64.AppImage
-```
-
-Plain `cargo build --release` also works (binary for your own glibc). `cargo test` runs 55 tests, including
-end-to-end tests that run the real service and check the switch survives restarts.
-`cargo build --no-default-features` builds without the window (service + CLI only).
-
-AppImages need FUSE 2 to mount. If it is missing: `APPIMAGE_EXTRACT_AND_RUN=1 ./PenTouch-x86_64.AppImage`.
+See **BUILDING.md** - one command: `./build-appimage.sh --setup`.
 
 ## Troubleshooting
 
 * **"needs permission"** - press *Fix permissions*, or run `sudo ./PenTouch.AppImage --setup-permissions`.
-  It writes `/etc/udev/rules.d/70-pen-touch.rules` (`uaccess` for `/dev/uinput` and tablets) and makes sure the
-  `uinput` module loads at boot.
 * **Nothing happens** - `PenTouch.AppImage status` shows what the service sees.
 * **Cursor and touches land on different screens** - set the *Output* for "Pen Touchscreen (virtual)" in your
-  system's touch settings, and the *Cursor area* in the window to the same monitor.
+  system's touch settings, and the *Cursor area* in the window to the same monitor (wheel scrolling, the default,
+  only needs the cursor area).
+* **AppImage will not start (FUSE)** - `APPIMAGE_EXTRACT_AND_RUN=1 ./PenTouch-x86_64.AppImage`.

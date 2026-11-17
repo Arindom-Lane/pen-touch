@@ -1,7 +1,8 @@
 //! The window. It is only a remote control: the switch edits the saved config, and the
 //! background service (which keeps running after the window closes) does the work.
 
-use crate::config::{self, Config};
+use crate::clickmode::{self, Desktop, RealRunner, Runner};
+use crate::config::{self, Config, ScrollMethod};
 use std::time::SystemTime;
 use crate::paths::Paths;
 use crate::setup::{self, Perms, TabletAccess, UinputAccess};
@@ -56,6 +57,8 @@ pub struct App {
     last_perms: Instant,
     last_respawn: Instant,
     notice: Option<String>,
+    desktop: Desktop,
+    single_click: Option<bool>,
     fixing: Option<Receiver<Result<(), String>>>,
     spawn_service: bool,
 }
@@ -87,11 +90,27 @@ impl App {
             last_perms: Instant::now(),
             last_respawn: Instant::now(),
             notice,
+            desktop: Desktop::from_env(),
+            single_click: None,
             fixing: None,
             spawn_service,
         };
+        if spawn_service {
+            app.single_click = clickmode::read_single_click(&RealRunner, app.desktop);
+        }
         app.poll(true);
         app
+    }
+
+    /// Flip the desktop's own "single click opens files" setting.
+    pub fn set_single_click(&mut self, runner: &dyn Runner, on: bool) {
+        match clickmode::write_single_click(runner, self.desktop, on) {
+            Ok(msg) => {
+                self.single_click = Some(on);
+                self.notice = Some(msg);
+            }
+            Err(e) => self.notice = Some(e),
+        }
     }
 
     pub fn view(&self) -> View {
@@ -229,8 +248,14 @@ impl App {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.label(RichText::new("Tap = click   Drag = scroll   Hold = right-click").small().color(GREY));
-                ui.label(RichText::new("Double-tap text = select a word (drag the handles to extend)").small().color(GREY));
+                for line in [
+                    "Tap = click      Double-tap = select a word / open",
+                    "Triple-tap = select a line      Pen buttons = right / middle click",
+                    "Drag = scroll      Hold still = right-click",
+                    "Hold, then drag = select with a real mouse drag (text, several files, drag & drop)",
+                ] {
+                    ui.label(RichText::new(line).small().color(GREY));
+                }
                 ui.label(
                     RichText::new(
                         "Closing this window leaves it running. Turn the switch off to use the tablet \
@@ -277,9 +302,31 @@ impl App {
 
     fn options(&mut self, ui: &mut egui::Ui) {
         let before = self.cfg.clone();
+        let mut want_single_click: Option<bool> = None;
         egui::CollapsingHeader::new(RichText::new("Options").strong()).default_open(true).show(ui, |ui| {
             ui.checkbox(&mut self.cfg.start_at_login, "Start automatically when I log in");
-            ui.checkbox(&mut self.cfg.show_cursor, "Show a cursor that follows the pen");
+            ui.checkbox(&mut self.cfg.show_cursor, "Cursor follows the pen");
+            ui.horizontal(|ui| {
+                ui.label("Scrolling");
+                let name = |m: ScrollMethod| match m {
+                    ScrollMethod::Wheel => "Mouse wheel (works in every app)",
+                    ScrollMethod::Touch => "Touch (native; not for Dolphin)",
+                };
+                egui::ComboBox::from_id_salt("scroll").selected_text(name(self.cfg.scroll_method)).show_ui(ui, |ui| {
+                    for m in [ScrollMethod::Wheel, ScrollMethod::Touch] {
+                        ui.selectable_value(&mut self.cfg.scroll_method, m, name(m));
+                    }
+                });
+            });
+            if self.cfg.scroll_method == ScrollMethod::Wheel {
+                ui.horizontal(|ui| {
+                    ui.label("Scroll speed");
+                    ui.add(egui::Slider::new(&mut self.cfg.scroll_speed, 3.0..=80.0).fixed_decimals(0));
+                });
+                ui.label(RichText::new("The cursor stays where you started while you scroll (so the page under the pen scrolls) and glides back when you lift.").small().color(GREY));
+            } else {
+                ui.label(RichText::new("Touch: the cursor follows the pen while you scroll. Apps like Dolphin treat a touch drag as a selection - use the wheel there.").small().color(GREY));
+            }
             ui.horizontal(|ui| {
                 ui.label("Tap tolerance");
                 ui.add(egui::Slider::new(&mut self.cfg.tap_tolerance_mm, 0.5..=6.0).suffix(" mm"));
@@ -294,6 +341,22 @@ impl App {
                         }
                     });
             });
+            ui.add_space(4.0);
+            let mut sc = self.single_click.unwrap_or(false);
+            let known = self.desktop != Desktop::Unknown;
+            if ui.add_enabled(known, egui::Checkbox::new(&mut sc, "Single click opens files and folders")).changed() {
+                want_single_click = Some(sc);
+            }
+            ui.label(
+                RichText::new(if known {
+                    "Changes your desktop's own file-manager setting, so it also applies to a normal mouse."
+                } else {
+                    "Not available on this desktop - change it in your file manager's settings."
+                })
+                .small()
+                .color(GREY),
+            );
+            ui.add_space(4.0);
             ui.collapsing("Cursor area (several monitors)", |ui| {
                 ui.label(
                     RichText::new("Which part of the whole desktop the cursor covers (0 to 1). For touches, choose the output in your system's touch screen settings.")
@@ -318,6 +381,10 @@ impl App {
                 }
             });
         });
+
+        if let Some(on) = want_single_click {
+            self.set_single_click(&RealRunner, on);
+        }
 
         if self.cfg != before {
             self.cfg.sanitize();
@@ -358,7 +425,7 @@ pub fn run(paths: Paths) -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pen Touch")
             .with_app_id("pen-touch")
-            .with_inner_size([380.0, 640.0])
+            .with_inner_size([400.0, 760.0])
             .with_min_inner_size([340.0, 420.0])
             .with_icon(Arc::new(icon)),
         ..Default::default()
@@ -478,6 +545,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn single_click_reports_unsupported_desktops_instead_of_guessing() {
+        let mut app = App::build(tmp("gui-single"), false);
+        app.desktop = Desktop::Unknown;
+        app.set_single_click(&RealRunner, true);
+        assert!(app.notice.as_deref().unwrap_or("").contains("file manager"));
+        assert_eq!(app.single_click, None, "state untouched when nothing was changed");
     }
 
     #[test]

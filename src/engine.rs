@@ -117,7 +117,7 @@ pub fn run_engine(settings: Settings, stop: Arc<AtomicBool>, status: SharedStatu
             }
         };
 
-        let sink = match UinputSink::new(settings.show_cursor) {
+        let sink = match UinputSink::new() {
             Ok(s) => s,
             Err(e) => {
                 pen.release();
@@ -158,6 +158,7 @@ pub fn run_engine(settings: Settings, stop: Arc<AtomicBool>, status: SharedStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gesture::Btn;
     use crate::pipeline::tests::{geom, settings, Cmd, FakeSink, PEN};
     use crate::pipeline::{ABS_X, ABS_Y, BTN_TOUCH};
     use std::cell::Cell;
@@ -170,9 +171,18 @@ mod tests {
         clock: Rc<Cell<f64>>,
         script: VecDeque<(f64, Vec<Raw>)>,
         on_empty: Box<dyn Fn() -> io::Result<Vec<Raw>>>,
+        calls: Cell<u32>,
     }
     impl Pen for FakePen {
         fn wait(&mut self, timeout: Option<Duration>) -> io::Result<Vec<Raw>> {
+            self.calls.set(self.calls.get() + 1);
+            assert!(
+                self.calls.get() < 200_000,
+                "session loop is spinning: now={} timeout={:?} next_event={:?}",
+                self.clock.get(),
+                timeout,
+                self.script.front().map(|(t, _)| *t)
+            );
             let now = self.clock.get();
             let limit = now + timeout.map(|d| d.as_secs_f64()).unwrap_or(f64::INFINITY);
             match self.script.front() {
@@ -182,7 +192,9 @@ mod tests {
                     Ok(evs)
                 }
                 Some(_) => {
-                    self.clock.set(limit);
+                    // A full sleep lands just PAST the deadline: Duration truncates to whole
+                    // nanoseconds, so without the nudge a timer could stay a hair in the future.
+                    self.clock.set(limit + 1e-9);
                     Ok(vec![])
                 }
                 None => (self.on_empty)(),
@@ -192,15 +204,27 @@ mod tests {
 
     fn rig(script: Vec<(f64, Vec<Raw>)>, on_empty: Box<dyn Fn() -> io::Result<Vec<Raw>>>) -> (FakePen, Rc<Cell<f64>>) {
         let clock = Rc::new(Cell::new(0.0));
-        (FakePen { clock: clock.clone(), script: script.into(), on_empty }, clock)
+        (FakePen { clock: clock.clone(), script: script.into(), on_empty, calls: Cell::new(0) }, clock)
     }
 
     fn gone() -> Box<dyn Fn() -> io::Result<Vec<Raw>>> {
         Box::new(|| Err(io::Error::from_raw_os_error(libc::ENODEV)))
     }
 
-    fn touches(p: &Pipeline<FakeSink>) -> Vec<Cmd> {
-        p.sink().cmds.iter().copied().filter(|c| !matches!(c, Cmd::Cursor(..))).collect()
+    fn actions(p: &Pipeline<FakeSink>) -> Vec<Cmd> {
+        p.sink().cmds.iter().copied().filter(|c| !matches!(c, Cmd::Ptr(..))).collect()
+    }
+
+    /// A pen hovering, then touching, holding 0.4 s and dragging sideways: a mouse drag with the left button held.
+    fn hold_and_drag_script() -> Vec<(f64, Vec<Raw>)> {
+        let mut v = vec![
+            (0.0, vec![Raw::Key(PEN, 1), Raw::Abs(ABS_X, 5000), Raw::Abs(ABS_Y, 3000), Raw::Syn]),
+            (0.1, vec![Raw::Key(BTN_TOUCH, 1), Raw::Syn]),
+        ];
+        for i in 1..=10 {
+            v.push((0.5 + 0.006 * i as f64, vec![Raw::Abs(ABS_X, 5000 + 60 * i), Raw::Syn]));
+        }
+        v
     }
 
     #[test]
@@ -210,6 +234,7 @@ mod tests {
                 (0.00, vec![Raw::Key(PEN, 1), Raw::Abs(ABS_X, 7600), Raw::Abs(ABS_Y, 4750), Raw::Syn]),
                 (1.00, vec![Raw::Key(BTN_TOUCH, 1), Raw::Syn]),
                 (1.08, vec![Raw::Key(BTN_TOUCH, 0), Raw::Syn]),
+                (1.30, vec![Raw::Abs(ABS_X, 7610), Raw::Syn]), // still plugged in while the click plays out
             ],
             gone(),
         );
@@ -218,24 +243,19 @@ mod tests {
         let c = clock.clone();
         let end = session(&mut pen, &mut pipe, &stop, &move || c.get()).unwrap();
         assert_eq!(end, End::Disconnected);
-        assert_eq!(touches(&pipe), vec![Cmd::Down(16384, 16384), Cmd::Up], "down after the 20 ms arming timer, up after the debounce");
+        assert_eq!(actions(&pipe), vec![Cmd::Btn(Btn::Left, true), Cmd::Btn(Btn::Left, false)], "click after the lift debounce, released by its own timer");
+        let press = pipe.sink().cmds.iter().position(|c| *c == Cmd::Btn(Btn::Left, true)).unwrap();
+        assert_eq!(pipe.sink().cmds[press - 1], Cmd::Ptr(16384, 16384), "pointer exactly at the tap");
     }
 
     #[test]
-    fn unplugging_mid_touch_lifts_the_finger_first() {
-        let (mut pen, clock) = rig(
-            vec![
-                (0.0, vec![Raw::Key(PEN, 1), Raw::Abs(ABS_X, 100), Raw::Abs(ABS_Y, 100), Raw::Syn]),
-                (0.1, vec![Raw::Key(BTN_TOUCH, 1), Raw::Syn]),
-                (0.5, vec![Raw::Abs(ABS_X, 105), Raw::Syn]),
-            ],
-            gone(),
-        );
+    fn unplugging_mid_drag_releases_the_mouse_button() {
+        let (mut pen, clock) = rig(hold_and_drag_script(), gone());
         let mut pipe = Pipeline::new(FakeSink::default(), geom(), settings());
         let stop = AtomicBool::new(false);
         let c = clock.clone();
         assert_eq!(session(&mut pen, &mut pipe, &stop, &move || c.get()).unwrap(), End::Disconnected);
-        assert_eq!(touches(&pipe).last(), Some(&Cmd::Up), "no stuck finger on the virtual screen");
+        assert_eq!(actions(&pipe), vec![Cmd::Btn(Btn::Left, true), Cmd::Btn(Btn::Left, false)], "no stuck button after the tablet vanishes");
     }
 
     #[test]
@@ -243,11 +263,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = stop.clone();
         let (mut pen, clock) = rig(
-            vec![
-                (0.0, vec![Raw::Key(PEN, 1), Raw::Abs(ABS_X, 100), Raw::Abs(ABS_Y, 100), Raw::Syn]),
-                (0.1, vec![Raw::Key(BTN_TOUCH, 1), Raw::Syn]),
-                (0.4, vec![Raw::Abs(ABS_X, 101), Raw::Syn]), // finger has been down a while
-            ],
+            hold_and_drag_script(),
             Box::new(move || {
                 s2.store(true, Ordering::Relaxed); // "the user flipped the switch off"
                 Ok(vec![])
@@ -256,7 +272,26 @@ mod tests {
         let mut pipe = Pipeline::new(FakeSink::default(), geom(), settings());
         let c = clock.clone();
         assert_eq!(session(&mut pen, &mut pipe, &stop, &move || c.get()).unwrap(), End::Stopped);
-        assert_eq!(touches(&pipe), vec![Cmd::Down(216, 345), Cmd::Up]);
+        assert_eq!(actions(&pipe), vec![Cmd::Btn(Btn::Left, true), Cmd::Btn(Btn::Left, false)]);
+    }
+
+    #[test]
+    fn unplugging_mid_touch_scroll_lifts_the_finger() {
+        let mut v = vec![
+            (0.0, vec![Raw::Key(PEN, 1), Raw::Abs(ABS_X, 5000), Raw::Abs(ABS_Y, 8000), Raw::Syn]),
+            (0.1, vec![Raw::Key(BTN_TOUCH, 1), Raw::Syn]),
+        ];
+        for i in 1..=15 {
+            v.push((0.1 + 0.006 * i as f64, vec![Raw::Abs(ABS_Y, 8000 - 70 * i), Raw::Syn]));
+        }
+        let (mut pen, clock) = rig(v, gone());
+        let mut pipe = Pipeline::new(FakeSink::default(), geom(), settings());
+        let stop = AtomicBool::new(false);
+        let c = clock.clone();
+        assert_eq!(session(&mut pen, &mut pipe, &stop, &move || c.get()).unwrap(), End::Disconnected);
+        let a = actions(&pipe);
+        assert!(matches!(a.first(), Some(Cmd::Down(..))));
+        assert_eq!(a.last(), Some(&Cmd::Up), "no stuck finger on the virtual screen");
     }
 
     #[test]

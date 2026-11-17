@@ -7,10 +7,11 @@
 //!   pen-touch --install           (re)create the menu entry and login autostart
 //!   pen-touch --setup-permissions one-time udev rule + uinput setup (asks for admin rights)
 
+mod clickmode;
 mod config;
 mod daemon;
 mod engine;
-mod filter;
+mod gesture;
 mod input;
 mod paths;
 mod pipeline;
@@ -31,6 +32,7 @@ USAGE:
     pen-touch                      open the window
     pen-touch on | off | toggle    flip the saved switch (survives reboots)
     pen-touch status               show what the background service is doing
+    pen-touch single-click on|off  turn your desktop's single-click-to-open setting on or off
     pen-touch --daemon             run the background service (normally started at login)
     pen-touch --install            (re)create the menu entry and login autostart
     pen-touch --setup-permissions  one-time setup so your user may create virtual input devices
@@ -51,6 +53,34 @@ fn set_enabled(paths: &Paths, on: bool) -> i32 {
     }
     println!("Pen Touch is now {}.", if on { "ON" } else { "OFF" });
     0
+}
+
+fn single_click(arg: Option<&str>) -> i32 {
+    use clickmode::{read_single_click, write_single_click, Desktop, RealRunner};
+    let d = Desktop::from_env();
+    match arg {
+        Some("on") | Some("off") => match write_single_click(&RealRunner, d, arg == Some("on")) {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("pen-touch: {e}");
+                1
+            }
+        },
+        None | Some("status") => {
+            match read_single_click(&RealRunner, d) {
+                Some(v) => println!("single click to open is {} ({:?})", if v { "ON" } else { "OFF" }, d),
+                None => println!("single click to open: unknown on this desktop ({d:?})"),
+            }
+            0
+        }
+        Some(other) => {
+            eprintln!("pen-touch: single-click wants 'on', 'off' or 'status', not '{other}'");
+            2
+        }
+    }
 }
 
 fn print_status(paths: &Paths) -> i32 {
@@ -82,6 +112,7 @@ fn main() {
             set_enabled(&paths, !now)
         }
         Some("status") => print_status(&paths),
+        Some("single-click") => single_click(args.get(1).map(String::as_str)),
         Some("--install") => {
             let cfg = Config::load(&paths);
             match setup::sync_integration(&paths, &setup::exe_path(), cfg.start_at_login) {

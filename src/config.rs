@@ -7,6 +7,18 @@ use std::fs;
 use std::io::{self, Write};
 use std::time::SystemTime;
 
+/// How a drag scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollMethod {
+    /// Mouse wheel under the pen. Works in every app, Dolphin and other Qt Widgets apps included.
+    /// The cursor stays where you started while you scroll and glides back when you lift.
+    Wheel,
+    /// A native touch contact: the app's own smooth scrolling, and the cursor follows the pen.
+    /// Apps without native touch scrolling (Dolphin) treat a touch drag as a selection instead.
+    Touch,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -14,8 +26,12 @@ pub struct Config {
     pub enabled: bool,
     /// Start the background service automatically when you log in.
     pub start_at_login: bool,
-    /// Show a mouse cursor that follows the pen (also while scrolling).
+    /// The mouse cursor follows the pen while hovering (and while touch-scrolling).
     pub show_cursor: bool,
+    /// Touch (native, default) or Wheel (fallback for apps that ignore touch scrolling).
+    pub scroll_method: ScrollMethod,
+    /// Wheel method only: wheel notches for a drag across the full tablet height.
+    pub scroll_speed: f64,
     /// How far (mm) the pen may wobble during a tap / long-press before it counts as a drag.
     pub tap_tolerance_mm: f64,
     /// 0, 90, 180 or 270: how the tablet is turned relative to the screen.
@@ -30,6 +46,8 @@ impl Default for Config {
             enabled: false,
             start_at_login: true,
             show_cursor: true,
+            scroll_method: ScrollMethod::Wheel,
+            scroll_speed: 20.0,
             tap_tolerance_mm: 2.0,
             rotation: 0,
             cursor_area: [0.0, 0.0, 1.0, 1.0],
@@ -89,6 +107,10 @@ impl Config {
             self.tap_tolerance_mm = 2.0;
         }
         self.tap_tolerance_mm = self.tap_tolerance_mm.clamp(0.5, 6.0);
+        if !self.scroll_speed.is_finite() {
+            self.scroll_speed = 20.0;
+        }
+        self.scroll_speed = self.scroll_speed.clamp(3.0, 80.0);
         let [x0, y0, x1, y1] = self.cursor_area;
         let ok = [x0, y0, x1, y1].iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) && x0 < x1 && y0 < y1;
         if !ok {
@@ -122,6 +144,8 @@ mod tests {
         c.rotation = 180;
         c.tap_tolerance_mm = 3.5;
         c.show_cursor = false;
+        c.scroll_method = ScrollMethod::Touch;
+        c.scroll_speed = 35.0;
         c.save(&p).unwrap();
         // "restart": a brand-new load sees exactly what was saved
         assert_eq!(Config::load(&p), c);
@@ -138,6 +162,7 @@ mod tests {
         fs::write(&p.config_file, "enabled = true\n").unwrap();
         let c = Config::load(&p);
         assert!(c.enabled && c.show_cursor && c.tap_tolerance_mm == 2.0);
+        assert_eq!(c.scroll_method, ScrollMethod::Wheel, "wheel scrolling is the default: it works in every app");
     }
 
     #[test]
@@ -146,12 +171,13 @@ mod tests {
         fs::create_dir_all(p.config_file.parent().unwrap()).unwrap();
         fs::write(
             &p.config_file,
-            "rotation = 45\ntap_tolerance_mm = 99.0\ncursor_area = [0.9, 0.0, 0.1, 1.0]\n",
+            "rotation = 45\ntap_tolerance_mm = 99.0\nscroll_speed = 1000.0\ncursor_area = [0.9, 0.0, 0.1, 1.0]\n",
         )
         .unwrap();
         let c = Config::load(&p);
         assert_eq!(c.rotation, 0);
         assert_eq!(c.tap_tolerance_mm, 6.0);
+        assert_eq!(c.scroll_speed, 80.0);
         assert_eq!(c.cursor_area, [0.0, 0.0, 1.0, 1.0]);
     }
 

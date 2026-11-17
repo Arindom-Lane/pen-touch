@@ -1,6 +1,6 @@
 [package]
 name = "pen-touch"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Use a pen tablet as a native touch screen, with an on/off switch that survives reboots"

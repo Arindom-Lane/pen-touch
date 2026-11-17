@@ -1,12 +1,13 @@
 //! The thin layer that talks to the kernel: finds the pen tablet, grabs it, and creates the two
-//! virtual devices (a multitouch screen and an absolute cursor). Everything above this is hardware-free.
+//! virtual devices (a multitouch screen and an absolute mouse). Everything above this is hardware-free.
 
 use crate::engine::Pen;
-use crate::pipeline::{Geometry, Raw, Sink, ABS_X, ABS_Y, BTN_TOUCH, OUT_MAX, TOOL_CODES};
+use crate::gesture::Btn;
+use crate::pipeline::{Geometry, Raw, Sink, WheelAcc, ABS_X, ABS_Y, BTN_TOUCH, OUT_MAX, TOOL_CODES};
 use evdev::uinput::VirtualDevice;
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, Device, EventType, InputEvent, InputId, KeyCode, PropType,
-    UinputAbsSetup,
+    RelativeAxisCode, UinputAbsSetup,
 };
 use std::fs;
 use std::io;
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const TOUCH_NAME: &str = "Pen Touchscreen (virtual)";
-pub const CURSOR_NAME: &str = "Pen Cursor (virtual)";
+pub const MOUSE_NAME: &str = "Pen Mouse (virtual)";
 
 // ---------------------------------------------------------------- finding the tablet
 
@@ -181,17 +182,24 @@ fn axis(code: AbsoluteAxisCode, min: i32, max: i32) -> UinputAbsSetup {
     UinputAbsSetup::new(code, AbsInfo::new(0, min, max, 0, 0, 0))
 }
 
-/// A multitouch screen with one finger, the pen cursor, or both.
+/// The two virtual devices: a multitouch screen (touch scrolling) and an absolute mouse
+/// (cursor, clicks, drags, wheel).
 pub struct UinputSink {
     touch: VirtualDevice,
-    cursor: Option<VirtualDevice>,
+    mouse: VirtualDevice,
     tracking_id: i32,
     touch_pos: (i32, i32),
-    cursor_pos: Option<(i32, i32)>,
+    mouse_pos: Option<(i32, i32)>,
+    down: [bool; 3],
+    wheel: WheelAcc,
+}
+
+fn rel_ev(code: RelativeAxisCode, v: i32) -> InputEvent {
+    InputEvent::new(EventType::RELATIVE.0, code.0, v)
 }
 
 impl UinputSink {
-    pub fn new(with_cursor: bool) -> io::Result<UinputSink> {
+    pub fn new() -> io::Result<UinputSink> {
         let mut keys = AttributeSet::<KeyCode>::new();
         keys.insert(KeyCode::BTN_TOUCH);
         let mut props = AttributeSet::<PropType>::new();
@@ -209,24 +217,36 @@ impl UinputSink {
             .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_MT_POSITION_Y, 0, OUT_MAX))?
             .build()?;
 
-        let cursor = if with_cursor {
-            let mut buttons = AttributeSet::<KeyCode>::new();
-            for b in [KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE] {
-                buttons.insert(b);
-            }
-            Some(
-                VirtualDevice::builder()?
-                    .name(CURSOR_NAME)
-                    .input_id(InputId::new(BusType::BUS_VIRTUAL, 0x1209, 0x5055, 1))
-                    .with_keys(&buttons)?
-                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X, 0, OUT_MAX))?
-                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, 0, OUT_MAX))?
-                    .build()?,
-            )
-        } else {
-            None
-        };
-        Ok(UinputSink { touch, cursor, tracking_id: 0, touch_pos: (0, 0), cursor_pos: None })
+        let mut buttons = AttributeSet::<KeyCode>::new();
+        for b in [KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE] {
+            buttons.insert(b);
+        }
+        let mut wheels = AttributeSet::<RelativeAxisCode>::new();
+        for w in [
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+        ] {
+            wheels.insert(w);
+        }
+        let mouse = VirtualDevice::builder()?
+            .name(MOUSE_NAME)
+            .input_id(InputId::new(BusType::BUS_VIRTUAL, 0x1209, 0x5055, 1))
+            .with_keys(&buttons)?
+            .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X, 0, OUT_MAX))?
+            .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, 0, OUT_MAX))?
+            .with_relative_axes(&wheels)?
+            .build()?;
+        Ok(UinputSink {
+            touch,
+            mouse,
+            tracking_id: 0,
+            touch_pos: (0, 0),
+            mouse_pos: None,
+            down: [false; 3],
+            wheel: WheelAcc::default(),
+        })
     }
 }
 
@@ -262,13 +282,46 @@ impl Sink for UinputSink {
         self.touch.emit(&[abs_ev(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1), key_ev(KeyCode::BTN_TOUCH, 0)])
     }
 
-    fn cursor_to(&mut self, x: i32, y: i32) -> io::Result<()> {
-        let Some(c) = self.cursor.as_mut() else { return Ok(()) };
-        if self.cursor_pos == Some((x, y)) {
+    fn pointer_to(&mut self, x: i32, y: i32) -> io::Result<()> {
+        if self.mouse_pos == Some((x, y)) {
             return Ok(());
         }
-        self.cursor_pos = Some((x, y));
-        c.emit(&[abs_ev(AbsoluteAxisCode::ABS_X, x), abs_ev(AbsoluteAxisCode::ABS_Y, y)])
+        self.mouse_pos = Some((x, y));
+        self.mouse.emit(&[abs_ev(AbsoluteAxisCode::ABS_X, x), abs_ev(AbsoluteAxisCode::ABS_Y, y)])
+    }
+
+    fn button(&mut self, b: Btn, down: bool) -> io::Result<()> {
+        let (i, code) = match b {
+            Btn::Left => (0, KeyCode::BTN_LEFT),
+            Btn::Right => (1, KeyCode::BTN_RIGHT),
+            Btn::Middle => (2, KeyCode::BTN_MIDDLE),
+        };
+        if self.down[i] == down {
+            return Ok(());
+        }
+        self.down[i] = down;
+        self.mouse.emit(&[key_ev(code, down as i32)])
+    }
+
+    fn wheel(&mut self, hx: f64, hy: f64) -> io::Result<()> {
+        let o = self.wheel.push(hx, hy);
+        let mut ev = Vec::with_capacity(4);
+        if o.hires_v != 0 {
+            ev.push(rel_ev(RelativeAxisCode::REL_WHEEL_HI_RES, o.hires_v));
+        }
+        if o.ticks_v != 0 {
+            ev.push(rel_ev(RelativeAxisCode::REL_WHEEL, o.ticks_v));
+        }
+        if o.hires_h != 0 {
+            ev.push(rel_ev(RelativeAxisCode::REL_HWHEEL_HI_RES, o.hires_h));
+        }
+        if o.ticks_h != 0 {
+            ev.push(rel_ev(RelativeAxisCode::REL_HWHEEL, o.ticks_h));
+        }
+        if ev.is_empty() {
+            return Ok(());
+        }
+        self.mouse.emit(&ev)
     }
 }
 
@@ -327,7 +380,7 @@ mod tests {
         assert!(!looks_like_pen("Logitech Mouse", "", &mask(&[0x110, 0x111])));
         // our own devices are never picked up again
         assert!(!looks_like_pen(TOUCH_NAME, &intuos_abs(), &intuos_key()));
-        assert!(!looks_like_pen(CURSOR_NAME, &intuos_abs(), &intuos_key()));
+        assert!(!looks_like_pen(MOUSE_NAME, &intuos_abs(), &intuos_key()));
     }
 
     #[test]
